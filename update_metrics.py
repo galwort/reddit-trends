@@ -1,87 +1,62 @@
 import os
-import json
 import time
-from datetime import datetime, timezone, timedelta
 import sqlite3
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
-from azure.storage.blob import BlobServiceClient
+import praw
 
-def hour_prefixes(now_utc, lookback_hours):
-    prefixes = []
-    base = datetime.fromtimestamp(now_utc, tz=timezone.utc).replace(minute=0, second=0, microsecond=0)
-    for i in range(lookback_hours):
-        t = base - timedelta(hours=i)
-        prefixes.append(t.strftime("%Y/%m/%d/%H"))
-    return prefixes
-
-def insert_post(con, doc, blob_path):
-    p = doc["payload"]
-    cur = con.cursor()
-    cur.execute(
-        """
-        INSERT OR IGNORE INTO posts_raw
-        (post_id, subreddit, title, selftext, author, permalink, link_flair_text, created_utc, pulled_first_utc, raw_pointer)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            p.get("id"),
-            doc.get("subreddit"),
-            p.get("title") or "",
-            p.get("selftext") or "",
-            p.get("author") or "",
-            doc.get("permalink") or "",
-            p.get("link_flair_text"),
-            int(p.get("created_utc") or 0),
-            int(doc.get("pulled_at_epoch") or 0),
-            blob_path,
-        ),
-    )
-
-def upsert_metrics(con, doc, observed_utc):
-    p = doc["payload"]
-    cur = con.cursor()
-    cur.execute(
-        """
-        INSERT INTO post_metrics(post_id, observed_utc, score, num_comments, upvote_ratio)
-        VALUES(?, ?, ?, ?, ?)
-        ON CONFLICT(post_id, observed_utc) DO UPDATE SET
-          score=excluded.score,
-          num_comments=excluded.num_comments,
-          upvote_ratio=excluded.upvote_ratio
-        """,
-        (
-            p.get("id"),
-            int(observed_utc),
-            int(p.get("score") or 0),
-            int(p.get("num_comments") or 0),
-            float(p.get("upvote_ratio") or 0),
-        ),
-    )
+def now_utc():
+    return int(datetime.now(tz=timezone.utc).timestamp())
 
 def main():
     load_dotenv()
-    bsc = BlobServiceClient.from_connection_string(os.environ["AZURE_STORAGE_CONNECTION_STRING"])
-    container = bsc.get_container_client(os.environ["AZURE_CONTAINER"])
+    reddit = praw.Reddit(
+        client_id=os.environ["REDDIT_CLIENT_ID"],
+        client_secret=os.environ["REDDIT_CLIENT_SECRET"],
+        username=os.environ["REDDIT_USERNAME"],
+        password=os.environ["REDDIT_PASSWORD"],
+        user_agent=os.environ["REDDIT_USER_AGENT"],
+    )
     db_path = os.environ.get("SQLITE_DB", "reddit_trends.db")
     con = sqlite3.connect(db_path)
     con.execute("PRAGMA journal_mode=WAL")
-    now_utc = int(datetime.now(tz=timezone.utc).timestamp())
-    lookback_hours = int(os.environ.get("LOAD_LOOKBACK_HOURS", "6"))
-    prefixes = hour_prefixes(now_utc, lookback_hours)
+    cur = con.cursor()
+    lookback_hours = int(os.environ.get("REFRESH_LOOKBACK_HOURS", "48"))
+    created_after = now_utc() - lookback_hours * 3600
+    cur.execute(
+        """
+        SELECT post_id FROM posts_raw
+        WHERE created_utc >= ?
+        """,
+        (created_after,),
+    )
+    ids = [row[0] for row in cur.fetchall()]
+    ts = now_utc()
     total = 0
-    for prefix in prefixes:
-        for blob in container.list_blobs(name_starts_with=f"{prefix}/"):
-            if not blob.name.endswith(".json"):
-                continue
-            data = container.download_blob(blob.name).readall()
-            doc = json.loads(data.decode("utf-8"))
-            insert_post(con, doc, blob.name)
-            observed = doc.get("pulled_at_epoch", now_utc)
-            upsert_metrics(con, doc, observed)
+    for pid in ids:
+        try:
+            s = reddit.submission(id=pid)
+            score = int(getattr(s, "score", 0) or 0)
+            num_comments = int(getattr(s, "num_comments", 0) or 0)
+            upvote_ratio = float(getattr(s, "upvote_ratio", 0.0) or 0.0)
+            cur.execute(
+                """
+                INSERT INTO post_metrics(post_id, observed_utc, score, num_comments, upvote_ratio)
+                VALUES(?, ?, ?, ?, ?)
+                ON CONFLICT(post_id, observed_utc) DO UPDATE SET
+                  score=excluded.score,
+                  num_comments=excluded.num_comments,
+                  upvote_ratio=excluded.upvote_ratio
+                """,
+                (pid, ts, score, num_comments, upvote_ratio),
+            )
             total += 1
+        except Exception as e:
+            print(f"refresh error {pid} {e}")
+            continue
     con.commit()
     con.close()
-    print(f"loaded or updated {total} records into sqlite")
+    print(f"refreshed {total} snapshots at {ts}")
 
 if __name__ == "__main__":
     main()
