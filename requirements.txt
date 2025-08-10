@@ -1,0 +1,4 @@
+praw
+azure-storage-blob
+python-dotenv
+PyYAML

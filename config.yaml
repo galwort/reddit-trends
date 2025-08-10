@@ -1,0 +1,6 @@
+subreddits:
+  - MachineLearning
+  - LocalLLaMA
+  - technology
+pull_window: hour
+max_posts_per_sub: 50
