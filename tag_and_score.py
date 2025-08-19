@@ -93,13 +93,13 @@ def main():
         )
         user = f"Text:\n{text[:6000]}"
         try:
-            resp = client.responses.create(
+            resp = client.responses.parse(
                 model="gpt-4o",
                 input=[
                     {"role": "system", "content": sys},
                     {"role": "user", "content": user},
                 ],
-                text_schema=TagList,
+                text_format=TagList,
                 temperature=0,
             )
             parsed = resp.output_parsed

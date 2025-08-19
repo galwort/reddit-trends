@@ -1,4 +1,6 @@
 praw
 azure-storage-blob
+openai
+pydantic
 python-dotenv
 PyYAML
