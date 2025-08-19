@@ -6,7 +6,7 @@ con = sqlite3.connect(db_path)
 cur = con.cursor()
 cur.execute("PRAGMA journal_mode=WAL")
 cur.execute("""
-CREATE TABLE IF NOT EXISTS posts_raw (
+CREATE TABLE IF NOT EXISTS posts (
   post_id TEXT PRIMARY KEY,
   subreddit TEXT NOT NULL,
   title TEXT,
@@ -27,18 +27,18 @@ CREATE TABLE IF NOT EXISTS post_metrics (
   num_comments INTEGER,
   upvote_ratio REAL,
   PRIMARY KEY (post_id, observed_utc),
-  FOREIGN KEY (post_id) REFERENCES posts_raw(post_id) ON DELETE CASCADE
+  FOREIGN KEY (post_id) REFERENCES posts(post_id) ON DELETE CASCADE
 )
 """)
 cur.execute("""
-CREATE TABLE IF NOT EXISTS tags_enriched (
+CREATE TABLE IF NOT EXISTS tags (
   post_id TEXT NOT NULL,
   tag TEXT NOT NULL,
   sentiment REAL,
   confidence REAL,
   source TEXT,
   PRIMARY KEY (post_id, tag),
-  FOREIGN KEY (post_id) REFERENCES posts_raw(post_id) ON DELETE CASCADE
+  FOREIGN KEY (post_id) REFERENCES posts(post_id) ON DELETE CASCADE
 )
 """)
 cur.execute("""
@@ -49,23 +49,7 @@ CREATE TABLE IF NOT EXISTS tag_embeddings (
   updated_utc INTEGER NOT NULL
 )
 """)
-cur.execute("""
-CREATE TABLE IF NOT EXISTS tag_groups (
-  group_id TEXT PRIMARY KEY,
-  canonical_tag TEXT NOT NULL,
-  created_utc INTEGER NOT NULL
-)
-""")
-cur.execute("""
-CREATE TABLE IF NOT EXISTS tag_group_members (
-  group_id TEXT NOT NULL,
-  tag TEXT NOT NULL,
-  strength REAL NOT NULL,
-  PRIMARY KEY (group_id, tag),
-  FOREIGN KEY (group_id) REFERENCES tag_groups(group_id)
-)
-""")
-cur.execute("CREATE INDEX IF NOT EXISTS idx_posts_created ON posts_raw(created_utc)")
+cur.execute("CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created_utc)")
 cur.execute("CREATE INDEX IF NOT EXISTS idx_metrics_post ON post_metrics(post_id, observed_utc DESC)")
 con.commit()
 con.close()

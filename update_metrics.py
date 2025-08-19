@@ -25,7 +25,7 @@ def main():
     created_after = now_utc() - lookback_hours * 3600
     cur.execute(
         """
-        SELECT post_id FROM posts_raw
+        SELECT post_id FROM posts
         WHERE created_utc >= ?
         """,
         (created_after,),

@@ -19,7 +19,7 @@ def insert_post(con, doc, blob_path):
     cur = con.cursor()
     cur.execute(
         """
-        INSERT OR IGNORE INTO posts_raw
+        INSERT OR IGNORE INTO posts
         (post_id, subreddit, title, selftext, author, permalink, link_flair_text, created_utc, pulled_first_utc, raw_pointer)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
