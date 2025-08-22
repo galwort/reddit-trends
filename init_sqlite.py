@@ -49,6 +49,31 @@ CREATE TABLE IF NOT EXISTS tag_embeddings (
   updated_utc INTEGER NOT NULL
 )
 """)
+cur.execute("""
+CREATE TABLE IF NOT EXISTS trends (
+  trend_id TEXT PRIMARY KEY,
+  subreddit TEXT NOT NULL,
+  window_size_seconds INTEGER NOT NULL,
+  start_utc INTEGER NOT NULL,
+  end_utc INTEGER NOT NULL,
+  tag_count INTEGER NOT NULL,
+  unique_tag_count INTEGER NOT NULL,
+  mean_probability REAL,
+  centroid_json TEXT NOT NULL,
+  label TEXT,
+  label_model TEXT,
+  created_utc INTEGER NOT NULL
+)
+""")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS trend_tags (
+  trend_id TEXT NOT NULL,
+  tag TEXT NOT NULL,
+  count INTEGER NOT NULL,
+  PRIMARY KEY (trend_id, tag),
+  FOREIGN KEY (trend_id) REFERENCES trends(trend_id) ON DELETE CASCADE
+)
+""")
 cur.execute("CREATE INDEX IF NOT EXISTS idx_posts_created ON posts(created_utc)")
 cur.execute("CREATE INDEX IF NOT EXISTS idx_metrics_post ON post_metrics(post_id, observed_utc DESC)")
 con.commit()
