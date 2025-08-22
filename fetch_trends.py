@@ -10,6 +10,7 @@ import hdbscan
 from sklearn.preprocessing import normalize
 from pydantic import BaseModel, Field
 from openai import OpenAI
+import warnings
 
 SQLITE_DB = os.environ.get("SQLITE_DB", "reddit_trends.db")
 WINDOW_SIZES = [86400, 259200, 604800, 1209600]
@@ -22,6 +23,8 @@ SPIKE_MIN_SIZE = int(os.environ.get("SPIKE_MIN_SIZE", "15"))
 SPIKE_MIN_PROB = float(os.environ.get("SPIKE_MIN_PROB", "0.8"))
 LABEL_MODEL = os.environ.get("LABEL_MODEL", "gpt-4o")
 
+warnings.filterwarnings("ignore", category=FutureWarning)
+                        
 class TrendLabel(BaseModel):
     label: str = Field(..., min_length=3, max_length=60)
     description: str = Field(..., min_length=6, max_length=160)
