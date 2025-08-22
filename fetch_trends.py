@@ -7,7 +7,7 @@ import sqlite3
 from typing import Dict, List, Tuple
 import numpy as np
 import hdbscan
-from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.preprocessing import normalize
 from pydantic import BaseModel, Field
 from openai import OpenAI
 
@@ -66,39 +66,52 @@ def fetch_subreddits(con: sqlite3.Connection) -> List[str]:
     cur.execute("SELECT DISTINCT subreddit FROM posts")
     return [r[0] for r in cur.fetchall()]
 
-def fetch_window_embeddings(con: sqlite3.Connection, subreddit: str, start_ts: int, end_ts: int) -> Tuple[List[str], np.ndarray, List[float]]:
+def fetch_window_embeddings(con: sqlite3.Connection, subreddit: str, start_ts: int, end_ts: int) -> Tuple[List[str], np.ndarray]:
     cur = con.cursor()
     cur.execute("""
-        SELECT t.tag, e.embedding_json, COALESCE(tb.prob, 1.0)
+        SELECT t.tag, e.embedding_json
         FROM tags t
         JOIN posts p ON p.post_id = t.post_id
         JOIN tag_embeddings e ON e.tag = t.tag
-        LEFT JOIN (
-            SELECT NULL AS tag, NULL AS prob
-        ) tb ON 1=0
         WHERE p.subreddit = ?
           AND p.created_utc >= ?
           AND p.created_utc < ?
     """, (subreddit, start_ts, end_ts))
     rows = cur.fetchall()
     if not rows:
-        return [], np.empty((0,)), []
+        return [], np.empty((0,)), 
     tags = []
     vecs = []
-    probs = []
-    for tag, emb_json, prob in rows:
+    for tag, emb_json in rows:
         v = np.array(json.loads(emb_json), dtype=np.float32)
         tags.append(tag)
         vecs.append(v)
-        probs.append(float(prob if prob is not None else 1.0))
     X = np.vstack(vecs) if vecs else np.empty((0,))
-    return tags, X, probs
+    return tags, X
+
+def l2_normalize_matrix(X: np.ndarray) -> np.ndarray:
+    if X.size == 0:
+        return X
+    return normalize(X, norm="l2")
+
+def l2_normalize_vector(v: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(v)
+    if n == 0:
+        return v
+    return v / n
+
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    denom = np.linalg.norm(a) * np.linalg.norm(b)
+    if denom == 0:
+        return 0.0
+    return float(np.dot(a, b) / denom)
 
 def cluster_window(tags: List[str], X: np.ndarray) -> Dict[int, Dict]:
     if X.size == 0:
         return {}
-    clusterer = hdbscan.HDBSCAN(min_cluster_size=MIN_CLUSTER_SIZE, metric="cosine")
-    labels = clusterer.fit_predict(X)
+    Xn = l2_normalize_matrix(X)
+    clusterer = hdbscan.HDBSCAN(min_cluster_size=MIN_CLUSTER_SIZE, metric="euclidean")
+    labels = clusterer.fit_predict(Xn)
     probs = clusterer.probabilities_
     clusters: Dict[int, Dict] = {}
     for idx, lbl in enumerate(labels):
@@ -109,8 +122,9 @@ def cluster_window(tags: List[str], X: np.ndarray) -> Dict[int, Dict]:
         d["tags"].append(tags[idx])
         d["probs"].append(float(probs[idx]))
     for lbl, d in list(clusters.items()):
-        vecs = X[d["indices"]]
+        vecs = Xn[d["indices"]]
         centroid = vecs.mean(axis=0)
+        centroid = l2_normalize_vector(centroid)
         d["centroid"] = centroid
         d["size"] = len(d["indices"])
         d["mean_prob"] = float(np.mean(d["probs"])) if d["probs"] else 0.0
@@ -118,9 +132,6 @@ def cluster_window(tags: List[str], X: np.ndarray) -> Dict[int, Dict]:
         for tg in d["tags"]:
             d["tag_counts"][tg] = d["tag_counts"].get(tg, 0) + 1
     return clusters
-
-def cosine(a: np.ndarray, b: np.ndarray) -> float:
-    return float(cosine_similarity(a.reshape(1, -1), b.reshape(1, -1))[0][0])
 
 def jaccard(a: set, b: set) -> float:
     if not a and not b:
@@ -145,7 +156,7 @@ def stitch_clusters(window_clusters: List[Dict]) -> List[List[Dict]]:
                 continue
             if nxt["start"] < last["end"]:
                 continue
-            sim = cosine(last["centroid"], nxt["centroid"])
+            sim = cosine_sim(last["centroid"], nxt["centroid"])
             jac = jaccard(set(last["tag_counts"].keys()), set(nxt["tag_counts"].keys()))
             if sim >= SIM_THRESHOLD and jac >= JACCARD_THRESHOLD:
                 chain.append(nxt)
@@ -174,6 +185,7 @@ def summarize_chain(chain: List[Dict]) -> Dict:
         for tg, ct in c["tag_counts"].items():
             all_tags[tg] = all_tags.get(tg, 0) + ct
     centroid = np.mean(np.vstack([c["centroid"] for c in chain]), axis=0)
+    centroid = l2_normalize_vector(centroid)
     mean_prob = float(np.mean([c["mean_prob"] for c in chain]))
     start_utc = min(c["start"] for c in chain)
     end_utc = max(c["end"] for c in chain)
@@ -245,7 +257,7 @@ def main():
                 e = s + w
                 if s >= tmax:
                     break
-                tags, X, _ = fetch_window_embeddings(con, sub, s, e)
+                tags, X = fetch_window_embeddings(con, sub, s, e)
                 if X.size == 0:
                     continue
                 clusters = cluster_window(tags, X)
