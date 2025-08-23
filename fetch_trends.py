@@ -16,6 +16,13 @@ from pydantic import BaseModel, Field
 from openai import OpenAI
 
 SQLITE_DB = os.environ.get("SQLITE_DB", "reddit_trends.db")
+SQLITE_TIMEOUT_SEC = int(os.environ.get("SQLITE_TIMEOUT_SEC", "30"))
+SQLITE_BUSY_TIMEOUT_MS = int(os.environ.get("SQLITE_BUSY_TIMEOUT_MS", "60000"))
+RETRY_MAX_ATTEMPTS = int(os.environ.get("RETRY_MAX_ATTEMPTS", "8"))
+RETRY_BASE_DELAY_SEC = float(os.environ.get("RETRY_BASE_DELAY_SEC", "0.25"))
+RETRY_BACKOFF = float(os.environ.get("RETRY_BACKOFF", "1.8"))
+RETRY_MAX_DELAY_SEC = float(os.environ.get("RETRY_MAX_DELAY_SEC", "3.0"))
+
 WINDOW_SIZES = [86400, 259200, 604800, 1209600]
 MIN_CLUSTER_SIZE = int(os.environ.get("MIN_CLUSTER_SIZE", "5"))
 STITCH_SIM_THRESHOLD = float(os.environ.get("STITCH_SIM_THRESHOLD", "0.9"))
@@ -35,9 +42,61 @@ class TrendLabel(BaseModel):
     label: str = Field(..., min_length=3, max_length=60)
     description: str = Field(..., min_length=6, max_length=160)
 
+def connect_db(path: str) -> sqlite3.Connection:
+    con = sqlite3.connect(path, timeout=SQLITE_TIMEOUT_SEC)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    return con
+
+def is_locked_error(e: Exception) -> bool:
+    s = str(e).lower()
+    return isinstance(e, sqlite3.OperationalError) and ("database is locked" in s or "database table is locked" in s or "database schema is locked" in s)
+
+def run_with_retry(fn):
+    delay = RETRY_BASE_DELAY_SEC
+    last = None
+    for _ in range(RETRY_MAX_ATTEMPTS):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if is_locked_error(e):
+                time.sleep(delay)
+                delay = min(RETRY_MAX_DELAY_SEC, delay * RETRY_BACKOFF)
+                continue
+            raise
+    if last:
+        raise last
+
+def execute_retry(cur: sqlite3.Cursor, sql: str, params: Tuple = ()) -> None:
+    def op():
+        cur.execute(sql, params)
+    run_with_retry(op)
+
+def executemany_retry(cur: sqlite3.Cursor, sql: str, seq) -> None:
+    def op():
+        cur.executemany(sql, seq)
+    run_with_retry(op)
+
+def fetchone_retry(cur: sqlite3.Cursor) -> Tuple:
+    def op():
+        return cur.fetchone()
+    return run_with_retry(op)
+
+def fetchall_retry(cur: sqlite3.Cursor) -> List[Tuple]:
+    def op():
+        return cur.fetchall()
+    return run_with_retry(op)
+
+def commit_retry(con: sqlite3.Connection) -> None:
+    def op():
+        con.commit()
+    run_with_retry(op)
+
 def ensure_trend_tables(con: sqlite3.Connection) -> None:
     cur = con.cursor()
-    cur.execute("""
+    execute_retry(cur, """
     CREATE TABLE IF NOT EXISTS trends (
       trend_id TEXT PRIMARY KEY,
       subreddit TEXT NOT NULL,
@@ -53,7 +112,7 @@ def ensure_trend_tables(con: sqlite3.Connection) -> None:
       created_utc INTEGER NOT NULL
     )
     """)
-    cur.execute("""
+    execute_retry(cur, """
     CREATE TABLE IF NOT EXISTS trend_tags (
       trend_id TEXT NOT NULL,
       tag TEXT NOT NULL,
@@ -62,22 +121,22 @@ def ensure_trend_tables(con: sqlite3.Connection) -> None:
       FOREIGN KEY (trend_id) REFERENCES trends(trend_id) ON DELETE CASCADE
     )
     """)
-    con.commit()
+    commit_retry(con)
 
 def fetch_time_range(con: sqlite3.Connection, subreddit: str) -> Tuple[int, int]:
     cur = con.cursor()
-    cur.execute("SELECT MIN(created_utc), MAX(created_utc) FROM posts WHERE subreddit = ?", (subreddit,))
-    row = cur.fetchone()
+    execute_retry(cur, "SELECT MIN(created_utc), MAX(created_utc) FROM posts WHERE subreddit = ?", (subreddit,))
+    row = fetchone_retry(cur)
     return (row[0] or 0, row[1] or 0)
 
 def fetch_subreddits(con: sqlite3.Connection) -> List[str]:
     cur = con.cursor()
-    cur.execute("SELECT DISTINCT subreddit FROM posts")
-    return [r[0] for r in cur.fetchall()]
+    execute_retry(cur, "SELECT DISTINCT subreddit FROM posts")
+    return [r[0] for r in fetchall_retry(cur)]
 
 def fetch_window_embeddings(con: sqlite3.Connection, subreddit: str, start_ts: int, end_ts: int) -> Tuple[List[str], np.ndarray]:
     cur = con.cursor()
-    cur.execute("""
+    execute_retry(cur, """
         SELECT t.tag, e.embedding_json
         FROM tags t
         JOIN posts p ON p.post_id = t.post_id
@@ -86,7 +145,7 @@ def fetch_window_embeddings(con: sqlite3.Connection, subreddit: str, start_ts: i
           AND p.created_utc >= ?
           AND p.created_utc < ?
     """, (subreddit, start_ts, end_ts))
-    rows = cur.fetchall()
+    rows = fetchall_retry(cur)
     if not rows:
         return [], np.empty((0,))
     tags = []
@@ -323,7 +382,7 @@ def choose_fallback_label(tags: Dict[str, int]) -> str:
 def insert_trend(con: sqlite3.Connection, subreddit: str, window_size: int, summary: Dict, lab: TrendLabel) -> str:
     tid = str(uuid.uuid4())
     cur = con.cursor()
-    cur.execute("""
+    execute_retry(cur, """
         INSERT INTO trends(trend_id, subreddit, window_size_seconds, start_utc, end_utc, tag_count, unique_tag_count, mean_probability, centroid_json, label, label_model, created_utc)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
     """, (
@@ -341,13 +400,12 @@ def insert_trend(con: sqlite3.Connection, subreddit: str, window_size: int, summ
         int(time.time())
     ))
     rows = [(tid, tg, int(ct)) for tg, ct in summary["tags"].items()]
-    cur.executemany("INSERT OR REPLACE INTO trend_tags(trend_id, tag, count) VALUES(?,?,?)", rows)
-    con.commit()
+    executemany_retry(cur, "INSERT OR REPLACE INTO trend_tags(trend_id, tag, count) VALUES(?,?,?)", rows)
+    commit_retry(con)
     return tid
 
 def main():
-    con = sqlite3.connect(SQLITE_DB)
-    con.execute("PRAGMA journal_mode=WAL")
+    con = connect_db(SQLITE_DB)
     ensure_trend_tables(con)
     subs = fetch_subreddits(con)
     client = OpenAI()
