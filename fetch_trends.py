@@ -1,3 +1,7 @@
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn.utils.deprecation")
+
 import os
 import json
 import time
@@ -10,21 +14,23 @@ import hdbscan
 from sklearn.preprocessing import normalize
 from pydantic import BaseModel, Field
 from openai import OpenAI
-import warnings
 
 SQLITE_DB = os.environ.get("SQLITE_DB", "reddit_trends.db")
 WINDOW_SIZES = [86400, 259200, 604800, 1209600]
 MIN_CLUSTER_SIZE = int(os.environ.get("MIN_CLUSTER_SIZE", "5"))
-SIM_THRESHOLD = float(os.environ.get("SIM_THRESHOLD", "0.9"))
-JACCARD_THRESHOLD = float(os.environ.get("JACCARD_THRESHOLD", "0.3"))
+STITCH_SIM_THRESHOLD = float(os.environ.get("STITCH_SIM_THRESHOLD", "0.9"))
+STITCH_JACCARD_THRESHOLD = float(os.environ.get("STITCH_JACCARD_THRESHOLD", "0.3"))
 PERSIST_MIN_WINDOWS = int(os.environ.get("PERSIST_MIN_WINDOWS", "2"))
-GROWTH_MIN_RATIO = float(os.environ.get("GROWTH_MIN_RATIO", "1.3"))
-SPIKE_MIN_SIZE = int(os.environ.get("SPIKE_MIN_SIZE", "15"))
-SPIKE_MIN_PROB = float(os.environ.get("SPIKE_MIN_PROB", "0.8"))
+COVERAGE_MAX_RATIO = float(os.environ.get("COVERAGE_MAX_RATIO", "0.5"))
+CONCENTRATION_TOPK = int(os.environ.get("CONCENTRATION_TOPK", "2"))
+CONCENTRATION_MIN_SHARE = float(os.environ.get("CONCENTRATION_MIN_SHARE", "0.6"))
+PEAK_TO_MEDIAN_RATIO = float(os.environ.get("PEAK_TO_MEDIAN_RATIO", "1.5"))
+MIN_UNIQUE_TAGS = int(os.environ.get("MIN_UNIQUE_TAGS", "3"))
+SPIKE_MIN_SIZE = int(os.environ.get("SPIKE_MIN_SIZE", "20"))
+SPECIFICITY_MIN = float(os.environ.get("SPECIFICITY_MIN", "0.4"))
+GENERIC_RATE_LIMIT = float(os.environ.get("GENERIC_RATE_LIMIT", "0.6"))
 LABEL_MODEL = os.environ.get("LABEL_MODEL", "gpt-4o")
 
-warnings.filterwarnings("ignore", category=FutureWarning)
-                        
 class TrendLabel(BaseModel):
     label: str = Field(..., min_length=3, max_length=60)
     description: str = Field(..., min_length=6, max_length=160)
@@ -82,7 +88,7 @@ def fetch_window_embeddings(con: sqlite3.Connection, subreddit: str, start_ts: i
     """, (subreddit, start_ts, end_ts))
     rows = cur.fetchall()
     if not rows:
-        return [], np.empty((0,)), 
+        return [], np.empty((0,))
     tags = []
     vecs = []
     for tag, emb_json in rows:
@@ -131,9 +137,10 @@ def cluster_window(tags: List[str], X: np.ndarray) -> Dict[int, Dict]:
         d["centroid"] = centroid
         d["size"] = len(d["indices"])
         d["mean_prob"] = float(np.mean(d["probs"])) if d["probs"] else 0.0
-        d["tag_counts"] = {}
+        counts: Dict[str, int] = {}
         for tg in d["tags"]:
-            d["tag_counts"][tg] = d["tag_counts"].get(tg, 0) + 1
+            counts[tg] = counts.get(tg, 0) + 1
+        d["tag_counts"] = counts
     return clusters
 
 def jaccard(a: set, b: set) -> float:
@@ -161,26 +168,76 @@ def stitch_clusters(window_clusters: List[Dict]) -> List[List[Dict]]:
                 continue
             sim = cosine_sim(last["centroid"], nxt["centroid"])
             jac = jaccard(set(last["tag_counts"].keys()), set(nxt["tag_counts"].keys()))
-            if sim >= SIM_THRESHOLD and jac >= JACCARD_THRESHOLD:
+            if sim >= STITCH_SIM_THRESHOLD and jac >= STITCH_JACCARD_THRESHOLD:
                 chain.append(nxt)
                 used.add(j)
                 last = nxt
         chains.append(chain)
     return chains
 
-def qualifies(chain: List[Dict]) -> bool:
+def concentration_share(counts: List[int], k: int) -> float:
+    if not counts:
+        return 0.0
+    s = sum(counts)
+    if s == 0:
+        return 0.0
+    top = sorted(counts, reverse=True)[:k]
+    return sum(top) / s
+
+def median_value(values: List[int]) -> float:
+    if not values:
+        return 0.0
+    arr = sorted(values)
+    n = len(arr)
+    if n % 2 == 1:
+        return float(arr[n // 2])
+    return float(arr[n // 2 - 1] + arr[n // 2]) / 2.0
+
+def chain_specificity(summary_tags: Dict[str, int], presence: Dict[str, int], total_windows: int) -> float:
+    if not summary_tags:
+        return 0.0
+    num = 0.0
+    den = 0.0
+    for tg, ct in summary_tags.items():
+        pres = presence.get(tg, 0)
+        rate = pres / max(1, total_windows)
+        spec = 1.0 - min(1.0, rate)
+        num += spec * ct
+        den += ct
+    if den == 0:
+        return 0.0
+    return num / den
+
+def qualifies(chain: List[Dict], total_windows: int, presence: Dict[str, int]) -> bool:
+    if not chain:
+        return False
+    counts = [c["size"] for c in chain]
     if len(chain) >= PERSIST_MIN_WINDOWS:
-        first = chain[0]["size"]
-        last = chain[-1]["size"]
-        if last >= max(1, int(math.ceil(first * GROWTH_MIN_RATIO))):
-            return True
-        if len(chain) >= 3:
-            return True
-    if len(chain) == 1:
+        cov = len(chain) / max(1, total_windows)
+        if cov > COVERAGE_MAX_RATIO:
+            return False
+        conc = concentration_share(counts, CONCENTRATION_TOPK)
+        if conc < CONCENTRATION_MIN_SHARE:
+            return False
+        med = median_value(counts)
+        peak = max(counts)
+        if med == 0:
+            growth_ok = peak >= SPIKE_MIN_SIZE
+        else:
+            growth_ok = (peak / med) >= PEAK_TO_MEDIAN_RATIO
+        if not growth_ok:
+            return False
+    else:
         c = chain[0]
-        if c["size"] >= SPIKE_MIN_SIZE and c["mean_prob"] >= SPIKE_MIN_PROB:
-            return True
-    return False
+        if c["size"] < SPIKE_MIN_SIZE:
+            return False
+    summary = summarize_chain(chain)
+    spec = chain_specificity(summary["tags"], presence, total_windows)
+    if spec < SPECIFICITY_MIN:
+        return False
+    if summary["unique"] < MIN_UNIQUE_TAGS:
+        return False
+    return True
 
 def summarize_chain(chain: List[Dict]) -> Dict:
     all_tags: Dict[str, int] = {}
@@ -202,18 +259,66 @@ def summarize_chain(chain: List[Dict]) -> Dict:
         "count": sum(all_tags.values())
     }
 
-def label_trend(client: OpenAI, subreddit: str, tags: Dict[str, int]) -> TrendLabel:
+def baseline_terms_from_presence(presence: Dict[str, int], total_windows: int, limit: int = 30) -> List[str]:
+    scored = []
+    for tg, pres in presence.items():
+        rate = pres / max(1, total_windows)
+        if rate >= GENERIC_RATE_LIMIT:
+            scored.append((rate, tg))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [t for _, t in scored[:limit]]
+
+def label_trend_llm(client: OpenAI, subreddit: str, tags: Dict[str, int], baseline_terms: List[str]) -> TrendLabel:
     top = sorted(tags.items(), key=lambda x: x[1], reverse=True)[:25]
     tag_list = [f"{t}:{c}" for t, c in top]
-    sys = "You are a trend namer. Produce a short label and a one line description."
-    user = f"Subreddit: {subreddit}\nTags with counts: {', '.join(tag_list)}\nReturn JSON with fields label and description."
-    resp = client.responses.parse(
-        model=LABEL_MODEL,
-        input=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
-        text_format=TrendLabel,
-        temperature=0
+    baseline = ", ".join(baseline_terms)
+    sys = (
+        "You name trends for an analytics dashboard. Use a plain descriptive label. "
+        "Constraints: use one to five words. Prefer proper nouns only when clearly present in the tags such as model names or product names. "
+        "Do not include the subreddit name. Do not produce labels that describe what the subreddit usually talks about. "
+        "Avoid marketing words such as pulse, hub, nexus, surge, revolution, momentum, guru, vortex, fusion, mastery, mania, craze. "
+        "Avoid made up compound words. Avoid cute phrasing. Keep capitalization minimal except for proper nouns. "
+        "Return compact JSON with fields label and description."
     )
-    return TrendLabel.model_validate(resp.output_parsed)
+    user = (
+        f"Subreddit for context only: {subreddit}\n"
+        f"Baseline topics to ignore when naming: {baseline}\n"
+        f"Tags with counts for this candidate trend: {', '.join(tag_list)}\n"
+        f"Name a clear descriptive label and a one line description of what connects these tags."
+    )
+    try:
+        resp = client.responses.parse(
+            model=LABEL_MODEL,
+            input=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            text_format=TrendLabel,
+            temperature=0
+        )
+        return TrendLabel.model_validate(resp.output_parsed)
+    except Exception:
+        label = choose_fallback_label(tags)
+        return TrendLabel(label=label, description="Automatic fallback label from top tags")
+
+def clean_token(s: str) -> str:
+    s = s.replace("_", " ").strip()
+    s = " ".join(s.split())
+    return s
+
+def choose_fallback_label(tags: Dict[str, int]) -> str:
+    if not tags:
+        return ""
+    scored = sorted(tags.items(), key=lambda x: x[1], reverse=True)[:3]
+    parts = [clean_token(t) for t, _ in scored]
+    seen = set()
+    final = []
+    for t in parts:
+        k = t.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        final.append(t)
+    if not final:
+        final = [clean_token(next(iter(tags.keys())))]
+    return " ".join(final)
 
 def insert_trend(con: sqlite3.Connection, subreddit: str, window_size: int, summary: Dict, lab: TrendLabel) -> str:
     tid = str(uuid.uuid4())
@@ -256,15 +361,22 @@ def main():
             step = max(1, w // 2)
             starts = list(range(tmin, tmax + 1, step))
             window_clusters = []
+            presence: Dict[str, int] = {}
+            total_windows = 0
             for s in starts:
                 e = s + w
                 if s >= tmax:
                     break
                 tags, X = fetch_window_embeddings(con, sub, s, e)
+                if tags:
+                    total_windows += 1
+                    seen = set(tags)
+                    for tg in seen:
+                        presence[tg] = presence.get(tg, 0) + 1
                 if X.size == 0:
                     continue
                 clusters = cluster_window(tags, X)
-                for lbl, d in clusters.items():
+                for _, d in clusters.items():
                     window_clusters.append({
                         "subreddit": sub,
                         "window_size": w,
@@ -275,14 +387,15 @@ def main():
                         "mean_prob": d["mean_prob"],
                         "size": d["size"]
                     })
-            if not window_clusters:
+            if not window_clusters or total_windows == 0:
                 continue
             chains = stitch_clusters(window_clusters)
+            baseline = baseline_terms_from_presence(presence, total_windows)
             for chain in chains:
-                if not qualifies(chain):
+                if not qualifies(chain, total_windows, presence):
                     continue
                 summary = summarize_chain(chain)
-                lab = label_trend(client, sub, summary["tags"])
+                lab = label_trend_llm(client, sub, summary["tags"], baseline)
                 insert_trend(con, sub, w, summary, lab)
     con.close()
 
