@@ -144,24 +144,12 @@ def ensure_trend_tables(con: sqlite3.Connection) -> None:
       tag_count INTEGER NOT NULL,
       unique_tag_count INTEGER NOT NULL,
       mean_probability REAL,
-      centroid_json TEXT NOT NULL,
       label TEXT,
       label_model TEXT,
       created_utc INTEGER NOT NULL,
-      generic_rate_limit REAL,
-      specificity_min REAL,
-      concentration_min_share REAL,
-      top_group_min_share REAL,
-      min_coherence REAL,
-      spike_min_size INTEGER,
-      min_unique_tags INTEGER,
-      dedup_sim_threshold REAL,
-      min_mean_prob REAL,
-      concentration_topk INTEGER,
-      stitch_sim_threshold REAL,
-      stitch_jaccard_threshold REAL,
-      min_cluster_size INTEGER,
-      label_tags_top_n INTEGER
+      coherence REAL,
+      purity REAL,
+      specificity REAL
     )
     """,
     )
@@ -641,16 +629,13 @@ def insert_trend(
     cur = con.cursor()
     execute_retry(
         cur,
-        f"""
+        """
         INSERT INTO trends(
             trend_id, subreddit, window_size_seconds, start_utc, end_utc,
-            tag_count, unique_tag_count, mean_probability, centroid_json,
+            tag_count, unique_tag_count, mean_probability,
             label, label_model, created_utc,
-            generic_rate_limit, specificity_min, concentration_min_share, top_group_min_share,
-            min_coherence, spike_min_size, min_unique_tags, dedup_sim_threshold,
-            min_mean_prob, concentration_topk, stitch_sim_threshold, stitch_jaccard_threshold,
-            min_cluster_size, label_tags_top_n
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            coherence, purity, specificity
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """,
         (
             tid,
@@ -661,24 +646,12 @@ def insert_trend(
             int(summary["count"]),
             int(summary["unique"]),
             float(summary["mean_prob"]),
-            json.dumps(summary["centroid"].tolist()),
             lab.label,
             LABEL_MODEL,
             int(time.time()),
-            float(GENERIC_RATE_LIMIT),
-            float(SPECIFICITY_MIN),
-            float(CONCENTRATION_MIN_SHARE),
-            float(TOP_GROUP_MIN_SHARE),
-            float(MIN_COHERENCE),
-            int(SPIKE_MIN_SIZE),
-            int(MIN_UNIQUE_TAGS),
-            float(DEDUP_SIM_THRESHOLD),
-            float(MIN_MEAN_PROB),
-            int(CONCENTRATION_TOPK),
-            float(STITCH_SIM_THRESHOLD),
-            float(STITCH_JACCARD_THRESHOLD),
-            int(MIN_CLUSTER_SIZE),
-            int(LABEL_TAGS_TOP_N),
+            float(summary.get("coherence", 0.0)),
+            float(summary.get("purity", 0.0)),
+            float(summary.get("specificity", 0.0)),
         ),
     )
     rows = [(tid, tg, int(ct)) for tg, ct in summary["tags_merged"].items()]
