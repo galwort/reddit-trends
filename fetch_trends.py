@@ -34,17 +34,23 @@ STITCH_JACCARD_THRESHOLD = float(os.environ.get("STITCH_JACCARD_THRESHOLD", "0.3
 PERSIST_MIN_WINDOWS = int(os.environ.get("PERSIST_MIN_WINDOWS", "2"))
 COVERAGE_MAX_RATIO = float(os.environ.get("COVERAGE_MAX_RATIO", "0.5"))
 CONCENTRATION_TOPK = int(os.environ.get("CONCENTRATION_TOPK", "2"))
-CONCENTRATION_MIN_SHARE = float(os.environ.get("CONCENTRATION_MIN_SHARE", "0.65"))
+CONCENTRATION_MIN_SHARE = float(
+    os.environ.get("CONCENTRATION_MIN_SHARE", "0.55")
+)  # lowered from 0.65
 PEAK_TO_MEDIAN_RATIO = float(os.environ.get("PEAK_TO_MEDIAN_RATIO", "1.5"))
-MIN_UNIQUE_TAGS = int(os.environ.get("MIN_UNIQUE_TAGS", "3"))
-SPIKE_MIN_SIZE = int(os.environ.get("SPIKE_MIN_SIZE", "20"))
-SPECIFICITY_MIN = float(os.environ.get("SPECIFICITY_MIN", "0.55"))
+MIN_UNIQUE_TAGS = int(os.environ.get("MIN_UNIQUE_TAGS", "1"))  # lowered from 3
+SPIKE_MIN_SIZE = int(os.environ.get("SPIKE_MIN_SIZE", "10"))  # lowered from 20
+SPECIFICITY_MIN = float(os.environ.get("SPECIFICITY_MIN", "0.45"))  # lowered from 0.55
 MIN_MEAN_PROB = float(os.environ.get("MIN_MEAN_PROB", "0.50"))
 GENERIC_RATE_LIMIT = float(os.environ.get("GENERIC_RATE_LIMIT", "0.8"))
-DEDUP_SIM_THRESHOLD = float(os.environ.get("DEDUP_SIM_THRESHOLD", "0.92"))
+DEDUP_SIM_THRESHOLD = float(
+    os.environ.get("DEDUP_SIM_THRESHOLD", "0.88")
+)  # lowered from 0.92
 COHERENCE_TOP_N = int(os.environ.get("COHERENCE_TOP_N", "20"))
-MIN_COHERENCE = float(os.environ.get("MIN_COHERENCE", "0.28"))
-TOP_GROUP_MIN_SHARE = float(os.environ.get("TOP_GROUP_MIN_SHARE", "0.55"))
+MIN_COHERENCE = float(os.environ.get("MIN_COHERENCE", "0.22"))  # lowered from 0.28
+TOP_GROUP_MIN_SHARE = float(
+    os.environ.get("TOP_GROUP_MIN_SHARE", "0.50")
+)  # lowered from 0.55
 LABEL_TAGS_TOP_N = int(os.environ.get("LABEL_TAGS_TOP_N", "18"))
 LABEL_MODEL = os.environ.get("LABEL_MODEL", "gpt-4o")
 VERBOSE = bool(int(os.environ.get("VERBOSE_TRENDS", "1")))
@@ -141,7 +147,21 @@ def ensure_trend_tables(con: sqlite3.Connection) -> None:
       centroid_json TEXT NOT NULL,
       label TEXT,
       label_model TEXT,
-      created_utc INTEGER NOT NULL
+      created_utc INTEGER NOT NULL,
+      generic_rate_limit REAL,
+      specificity_min REAL,
+      concentration_min_share REAL,
+      top_group_min_share REAL,
+      min_coherence REAL,
+      spike_min_size INTEGER,
+      min_unique_tags INTEGER,
+      dedup_sim_threshold REAL,
+      min_mean_prob REAL,
+      concentration_topk INTEGER,
+      stitch_sim_threshold REAL,
+      stitch_jaccard_threshold REAL,
+      min_cluster_size INTEGER,
+      label_tags_top_n INTEGER
     )
     """,
     )
@@ -621,9 +641,16 @@ def insert_trend(
     cur = con.cursor()
     execute_retry(
         cur,
-        """
-        INSERT INTO trends(trend_id, subreddit, window_size_seconds, start_utc, end_utc, tag_count, unique_tag_count, mean_probability, centroid_json, label, label_model, created_utc)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+        f"""
+        INSERT INTO trends(
+            trend_id, subreddit, window_size_seconds, start_utc, end_utc,
+            tag_count, unique_tag_count, mean_probability, centroid_json,
+            label, label_model, created_utc,
+            generic_rate_limit, specificity_min, concentration_min_share, top_group_min_share,
+            min_coherence, spike_min_size, min_unique_tags, dedup_sim_threshold,
+            min_mean_prob, concentration_topk, stitch_sim_threshold, stitch_jaccard_threshold,
+            min_cluster_size, label_tags_top_n
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """,
         (
             tid,
@@ -638,6 +665,20 @@ def insert_trend(
             lab.label,
             LABEL_MODEL,
             int(time.time()),
+            float(GENERIC_RATE_LIMIT),
+            float(SPECIFICITY_MIN),
+            float(CONCENTRATION_MIN_SHARE),
+            float(TOP_GROUP_MIN_SHARE),
+            float(MIN_COHERENCE),
+            int(SPIKE_MIN_SIZE),
+            int(MIN_UNIQUE_TAGS),
+            float(DEDUP_SIM_THRESHOLD),
+            float(MIN_MEAN_PROB),
+            int(CONCENTRATION_TOPK),
+            float(STITCH_SIM_THRESHOLD),
+            float(STITCH_JACCARD_THRESHOLD),
+            int(MIN_CLUSTER_SIZE),
+            int(LABEL_TAGS_TOP_N),
         ),
     )
     rows = [(tid, tg, int(ct)) for tg, ct in summary["tags_merged"].items()]
