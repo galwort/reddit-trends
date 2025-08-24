@@ -1,14 +1,18 @@
 import warnings
+
 warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn.utils.deprecation")
+warnings.filterwarnings(
+    "ignore", category=FutureWarning, module="sklearn.utils.deprecation"
+)
 
 import os
+import re
 import json
 import time
 import uuid
 import math
 import sqlite3
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Iterable
 import numpy as np
 import hdbscan
 from sklearn.preprocessing import normalize
@@ -30,17 +34,26 @@ STITCH_JACCARD_THRESHOLD = float(os.environ.get("STITCH_JACCARD_THRESHOLD", "0.3
 PERSIST_MIN_WINDOWS = int(os.environ.get("PERSIST_MIN_WINDOWS", "2"))
 COVERAGE_MAX_RATIO = float(os.environ.get("COVERAGE_MAX_RATIO", "0.5"))
 CONCENTRATION_TOPK = int(os.environ.get("CONCENTRATION_TOPK", "2"))
-CONCENTRATION_MIN_SHARE = float(os.environ.get("CONCENTRATION_MIN_SHARE", "0.6"))
+CONCENTRATION_MIN_SHARE = float(os.environ.get("CONCENTRATION_MIN_SHARE", "0.65"))
 PEAK_TO_MEDIAN_RATIO = float(os.environ.get("PEAK_TO_MEDIAN_RATIO", "1.5"))
 MIN_UNIQUE_TAGS = int(os.environ.get("MIN_UNIQUE_TAGS", "3"))
 SPIKE_MIN_SIZE = int(os.environ.get("SPIKE_MIN_SIZE", "20"))
-SPECIFICITY_MIN = float(os.environ.get("SPECIFICITY_MIN", "0.4"))
-GENERIC_RATE_LIMIT = float(os.environ.get("GENERIC_RATE_LIMIT", "0.6"))
+SPECIFICITY_MIN = float(os.environ.get("SPECIFICITY_MIN", "0.55"))
+MIN_MEAN_PROB = float(os.environ.get("MIN_MEAN_PROB", "0.50"))
+GENERIC_RATE_LIMIT = float(os.environ.get("GENERIC_RATE_LIMIT", "0.8"))
+DEDUP_SIM_THRESHOLD = float(os.environ.get("DEDUP_SIM_THRESHOLD", "0.92"))
+COHERENCE_TOP_N = int(os.environ.get("COHERENCE_TOP_N", "20"))
+MIN_COHERENCE = float(os.environ.get("MIN_COHERENCE", "0.28"))
+TOP_GROUP_MIN_SHARE = float(os.environ.get("TOP_GROUP_MIN_SHARE", "0.55"))
+LABEL_TAGS_TOP_N = int(os.environ.get("LABEL_TAGS_TOP_N", "18"))
 LABEL_MODEL = os.environ.get("LABEL_MODEL", "gpt-4o")
+VERBOSE = bool(int(os.environ.get("VERBOSE_TRENDS", "1")))
+
 
 class TrendLabel(BaseModel):
     label: str = Field(..., min_length=3, max_length=60)
     description: str = Field(..., min_length=6, max_length=160)
+
 
 def connect_db(path: str) -> sqlite3.Connection:
     con = sqlite3.connect(path, timeout=SQLITE_TIMEOUT_SEC)
@@ -49,9 +62,15 @@ def connect_db(path: str) -> sqlite3.Connection:
     con.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
     return con
 
+
 def is_locked_error(e: Exception) -> bool:
     s = str(e).lower()
-    return isinstance(e, sqlite3.OperationalError) and ("database is locked" in s or "database table is locked" in s or "database schema is locked" in s)
+    return isinstance(e, sqlite3.OperationalError) and (
+        "database is locked" in s
+        or "database table is locked" in s
+        or "database schema is locked" in s
+    )
+
 
 def run_with_retry(fn):
     delay = RETRY_BASE_DELAY_SEC
@@ -69,34 +88,47 @@ def run_with_retry(fn):
     if last:
         raise last
 
+
 def execute_retry(cur: sqlite3.Cursor, sql: str, params: Tuple = ()) -> None:
     def op():
         cur.execute(sql, params)
+
     run_with_retry(op)
+
 
 def executemany_retry(cur: sqlite3.Cursor, sql: str, seq) -> None:
     def op():
         cur.executemany(sql, seq)
+
     run_with_retry(op)
 
-def fetchone_retry(cur: sqlite3.Cursor) -> Tuple:
+
+def fetchone_retry(cur: sqlite3.Cursor):
     def op():
         return cur.fetchone()
+
     return run_with_retry(op)
 
-def fetchall_retry(cur: sqlite3.Cursor) -> List[Tuple]:
+
+def fetchall_retry(cur: sqlite3.Cursor):
     def op():
         return cur.fetchall()
+
     return run_with_retry(op)
+
 
 def commit_retry(con: sqlite3.Connection) -> None:
     def op():
         con.commit()
+
     run_with_retry(op)
+
 
 def ensure_trend_tables(con: sqlite3.Connection) -> None:
     cur = con.cursor()
-    execute_retry(cur, """
+    execute_retry(
+        cur,
+        """
     CREATE TABLE IF NOT EXISTS trends (
       trend_id TEXT PRIMARY KEY,
       subreddit TEXT NOT NULL,
@@ -111,8 +143,11 @@ def ensure_trend_tables(con: sqlite3.Connection) -> None:
       label_model TEXT,
       created_utc INTEGER NOT NULL
     )
-    """)
-    execute_retry(cur, """
+    """,
+    )
+    execute_retry(
+        cur,
+        """
     CREATE TABLE IF NOT EXISTS trend_tags (
       trend_id TEXT NOT NULL,
       tag TEXT NOT NULL,
@@ -120,23 +155,40 @@ def ensure_trend_tables(con: sqlite3.Connection) -> None:
       PRIMARY KEY (trend_id, tag),
       FOREIGN KEY (trend_id) REFERENCES trends(trend_id) ON DELETE CASCADE
     )
-    """)
+    """,
+    )
     commit_retry(con)
+
 
 def fetch_time_range(con: sqlite3.Connection, subreddit: str) -> Tuple[int, int]:
     cur = con.cursor()
-    execute_retry(cur, "SELECT MIN(created_utc), MAX(created_utc) FROM posts WHERE subreddit = ?", (subreddit,))
+    execute_retry(
+        cur,
+        "SELECT MIN(created_utc), MAX(created_utc) FROM posts WHERE subreddit = ?",
+        (subreddit,),
+    )
     row = fetchone_retry(cur)
     return (row[0] or 0, row[1] or 0)
+
 
 def fetch_subreddits(con: sqlite3.Connection) -> List[str]:
     cur = con.cursor()
     execute_retry(cur, "SELECT DISTINCT subreddit FROM posts")
     return [r[0] for r in fetchall_retry(cur)]
 
-def fetch_window_embeddings(con: sqlite3.Connection, subreddit: str, start_ts: int, end_ts: int) -> Tuple[List[str], np.ndarray]:
+
+def fetch_window_embeddings(
+    con: sqlite3.Connection, subreddit: str, start_ts: int, end_ts: int
+) -> Tuple[List[str], np.ndarray]:
+    """
+    Returns:
+        tags: list of tag strings for each row (duplicates allowed)
+        X:    matrix of embeddings aligned with tags
+    """
     cur = con.cursor()
-    execute_retry(cur, """
+    execute_retry(
+        cur,
+        """
         SELECT t.tag, e.embedding_json
         FROM tags t
         JOIN posts p ON p.post_id = t.post_id
@@ -144,7 +196,9 @@ def fetch_window_embeddings(con: sqlite3.Connection, subreddit: str, start_ts: i
         WHERE p.subreddit = ?
           AND p.created_utc >= ?
           AND p.created_utc < ?
-    """, (subreddit, start_ts, end_ts))
+    """,
+        (subreddit, start_ts, end_ts),
+    )
     rows = fetchall_retry(cur)
     if not rows:
         return [], np.empty((0,))
@@ -157,10 +211,12 @@ def fetch_window_embeddings(con: sqlite3.Connection, subreddit: str, start_ts: i
     X = np.vstack(vecs) if vecs else np.empty((0,))
     return tags, X
 
+
 def l2_normalize_matrix(X: np.ndarray) -> np.ndarray:
     if X.size == 0:
         return X
     return normalize(X, norm="l2")
+
 
 def l2_normalize_vector(v: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(v)
@@ -168,11 +224,13 @@ def l2_normalize_vector(v: np.ndarray) -> np.ndarray:
         return v
     return v / n
 
+
 def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
     denom = np.linalg.norm(a) * np.linalg.norm(b)
     if denom == 0:
         return 0.0
     return float(np.dot(a, b) / denom)
+
 
 def cluster_window(tags: List[str], X: np.ndarray) -> Dict[int, Dict]:
     if X.size == 0:
@@ -198,14 +256,21 @@ def cluster_window(tags: List[str], X: np.ndarray) -> Dict[int, Dict]:
         d["mean_prob"] = float(np.mean(d["probs"])) if d["probs"] else 0.0
         counts: Dict[str, int] = {}
         for tg in d["tags"]:
+
             counts[tg] = counts.get(tg, 0) + 1
         d["tag_counts"] = counts
     return clusters
+
 
 def jaccard(a: set, b: set) -> float:
     if not a and not b:
         return 0.0
     return len(a & b) / len(a | b)
+
+
+def _norm_key(s: str) -> str:
+    return " ".join(s.lower().replace("_", " ").split())
+
 
 def stitch_clusters(window_clusters: List[Dict]) -> List[List[Dict]]:
     chains: List[List[Dict]] = []
@@ -226,7 +291,11 @@ def stitch_clusters(window_clusters: List[Dict]) -> List[List[Dict]]:
             if nxt["start"] < last["end"]:
                 continue
             sim = cosine_sim(last["centroid"], nxt["centroid"])
-            jac = jaccard(set(last["tag_counts"].keys()), set(nxt["tag_counts"].keys()))
+
+            jac = jaccard(
+                set(_norm_key(t) for t in last["tag_counts"].keys()),
+                set(_norm_key(t) for t in nxt["tag_counts"].keys()),
+            )
             if sim >= STITCH_SIM_THRESHOLD and jac >= STITCH_JACCARD_THRESHOLD:
                 chain.append(nxt)
                 used.add(j)
@@ -234,14 +303,16 @@ def stitch_clusters(window_clusters: List[Dict]) -> List[List[Dict]]:
         chains.append(chain)
     return chains
 
-def concentration_share(counts: List[int], k: int) -> float:
+
+def concentration_share(counts: List[float], k: int) -> float:
     if not counts:
         return 0.0
-    s = sum(counts)
+    s = float(sum(counts))
     if s == 0:
         return 0.0
     top = sorted(counts, reverse=True)[:k]
-    return sum(top) / s
+    return float(sum(top) / s)
+
 
 def median_value(values: List[int]) -> float:
     if not values:
@@ -252,7 +323,100 @@ def median_value(values: List[int]) -> float:
         return float(arr[n // 2])
     return float(arr[n // 2 - 1] + arr[n // 2]) / 2.0
 
-def chain_specificity(summary_tags: Dict[str, int], presence: Dict[str, int], total_windows: int) -> float:
+
+def fetch_embeddings_for_tags(
+    con: sqlite3.Connection, tags: Iterable[str]
+) -> Dict[str, np.ndarray]:
+    tags = list(set(tags))
+    if not tags:
+        return {}
+    result: Dict[str, np.ndarray] = {}
+    cur = con.cursor()
+
+    CHUNK = 400
+    for i in range(0, len(tags), CHUNK):
+        chunk = tags[i : i + CHUNK]
+        placeholders = ",".join(["?"] * len(chunk))
+        execute_retry(
+            cur,
+            f"SELECT tag, embedding_json FROM tag_embeddings WHERE tag IN ({placeholders})",
+            tuple(chunk),
+        )
+        rows = fetchall_retry(cur)
+        for t, emb_json in rows:
+            result[t] = l2_normalize_vector(
+                np.array(json.loads(emb_json), dtype=np.float32)
+            )
+    return result
+
+
+def merge_similar_tags(
+    tag_counts: Dict[str, int],
+    tag_vecs: Dict[str, np.ndarray],
+    sim_thr: float = DEDUP_SIM_THRESHOLD,
+) -> Tuple[Dict[str, int], Dict[str, List[str]]]:
+    """
+    Merge tags that are near-duplicates by cosine similarity.
+    Returns:
+        merged_counts: counts per representative tag
+        groups: rep -> [members...]
+    """
+    tags = [t for t in tag_counts.keys() if t in tag_vecs]
+    if not tags:
+        return dict(tag_counts), {t: [t] for t in tag_counts}
+
+    reps: Dict[str, List[str]] = {}
+    assigned: Dict[str, str] = {}
+
+    for t in tags:
+        if t in assigned:
+            continue
+        base = t
+        group = [base]
+        v = tag_vecs[base]
+        for u in tags:
+            if u == base or u in assigned:
+                continue
+            sim = float(np.dot(v, tag_vecs[u]))
+            if sim >= sim_thr:
+                group.append(u)
+        for m in group:
+            assigned[m] = base
+        reps[base] = group
+
+    for t in tag_counts:
+        if t not in assigned:
+            reps[t] = [t]
+            assigned[t] = t
+
+    merged: Dict[str, int] = {}
+    for rep, members in reps.items():
+        merged[rep] = sum(tag_counts.get(m, 0) for m in members)
+
+    return merged, reps
+
+
+def pairwise_mean_cosine(rep_tags: List[str], tag_vecs: Dict[str, np.ndarray]) -> float:
+    if len(rep_tags) < 2:
+        return 1.0
+
+    rep_tags = rep_tags[:COHERENCE_TOP_N]
+    vecs = [tag_vecs[t] for t in rep_tags if t in tag_vecs]
+    if len(vecs) < 2:
+        return 1.0
+
+    sims = []
+    for i in range(len(vecs)):
+        for j in range(i + 1, len(vecs)):
+            sims.append(float(np.dot(vecs[i], vecs[j])))
+    if not sims:
+        return 1.0
+    return float(sum(sims) / len(sims))
+
+
+def chain_specificity(
+    summary_tags: Dict[str, int], presence: Dict[str, int], total_windows: int
+) -> float:
     if not summary_tags:
         return 0.0
     num = 0.0
@@ -267,58 +431,10 @@ def chain_specificity(summary_tags: Dict[str, int], presence: Dict[str, int], to
         return 0.0
     return num / den
 
-def qualifies(chain: List[Dict], total_windows: int, presence: Dict[str, int]) -> bool:
-    if not chain:
-        return False
-    counts = [c["size"] for c in chain]
-    if len(chain) >= PERSIST_MIN_WINDOWS:
-        cov = len(chain) / max(1, total_windows)
-        if cov > COVERAGE_MAX_RATIO:
-            return False
-        conc = concentration_share(counts, CONCENTRATION_TOPK)
-        if conc < CONCENTRATION_MIN_SHARE:
-            return False
-        med = median_value(counts)
-        peak = max(counts)
-        if med == 0:
-            growth_ok = peak >= SPIKE_MIN_SIZE
-        else:
-            growth_ok = (peak / med) >= PEAK_TO_MEDIAN_RATIO
-        if not growth_ok:
-            return False
-    else:
-        c = chain[0]
-        if c["size"] < SPIKE_MIN_SIZE:
-            return False
-    summary = summarize_chain(chain)
-    spec = chain_specificity(summary["tags"], presence, total_windows)
-    if spec < SPECIFICITY_MIN:
-        return False
-    if summary["unique"] < MIN_UNIQUE_TAGS:
-        return False
-    return True
 
-def summarize_chain(chain: List[Dict]) -> Dict:
-    all_tags: Dict[str, int] = {}
-    for c in chain:
-        for tg, ct in c["tag_counts"].items():
-            all_tags[tg] = all_tags.get(tg, 0) + ct
-    centroid = np.mean(np.vstack([c["centroid"] for c in chain]), axis=0)
-    centroid = l2_normalize_vector(centroid)
-    mean_prob = float(np.mean([c["mean_prob"] for c in chain]))
-    start_utc = min(c["start"] for c in chain)
-    end_utc = max(c["end"] for c in chain)
-    return {
-        "tags": all_tags,
-        "centroid": centroid,
-        "mean_prob": mean_prob,
-        "start": start_utc,
-        "end": end_utc,
-        "unique": len(all_tags),
-        "count": sum(all_tags.values())
-    }
-
-def baseline_terms_from_presence(presence: Dict[str, int], total_windows: int, limit: int = 30) -> List[str]:
+def baseline_terms_from_presence(
+    presence: Dict[str, int], total_windows: int, limit: int = 30
+) -> List[str]:
     scored = []
     for tg, pres in presence.items():
         rate = pres / max(1, total_windows)
@@ -327,82 +443,212 @@ def baseline_terms_from_presence(presence: Dict[str, int], total_windows: int, l
     scored.sort(key=lambda x: x[0], reverse=True)
     return [t for _, t in scored[:limit]]
 
-def label_trend_llm(client: OpenAI, subreddit: str, tags: Dict[str, int], baseline_terms: List[str]) -> TrendLabel:
-    top = sorted(tags.items(), key=lambda x: x[1], reverse=True)[:25]
-    tag_list = [f"{t}:{c}" for t, c in top]
-    baseline = ", ".join(baseline_terms)
+
+def tf_idf_weights(
+    counts: Dict[str, int], presence: Dict[str, int], total_windows: int
+) -> Dict[str, float]:
+    weighted: Dict[str, float] = {}
+    for t, c in counts.items():
+        df = presence.get(t, 0)
+        idf = math.log((total_windows + 1) / (df + 1))
+        weighted[t] = float(c) * idf
+    return weighted
+
+
+def summarize_chain(
+    chain: List[Dict],
+    con: sqlite3.Connection,
+    presence: Dict[str, int],
+    total_windows: int,
+    baseline_terms: List[str],
+) -> Dict:
+
+    all_tags: Dict[str, int] = {}
+    for c in chain:
+        for tg, ct in c["tag_counts"].items():
+            all_tags[tg] = all_tags.get(tg, 0) + ct
+
+    centroid = l2_normalize_vector(
+        np.mean(np.vstack([c["centroid"] for c in chain]), axis=0)
+    )
+    mean_prob = float(np.mean([c["mean_prob"] for c in chain]))
+    start_utc = min(c["start"] for c in chain)
+    end_utc = max(c["end"] for c in chain)
+
+    tag_vecs = fetch_embeddings_for_tags(con, all_tags.keys())
+    merged_counts, groups = merge_similar_tags(all_tags, tag_vecs, DEDUP_SIM_THRESHOLD)
+
+    tfidf = tf_idf_weights(merged_counts, presence, total_windows)
+
+    baseline_set = set(_norm_key(b) for b in baseline_terms)
+    filtered_for_label: Dict[str, float] = {
+        t: w for t, w in tfidf.items() if _norm_key(t) not in baseline_set
+    }
+
+    label_tags_sorted = sorted(
+        filtered_for_label.items(), key=lambda x: x[1], reverse=True
+    )
+    informative_order = [t for t, _ in label_tags_sorted]
+    coherence = pairwise_mean_cosine(informative_order, tag_vecs)
+    purity = concentration_share([w for _, w in label_tags_sorted], CONCENTRATION_TOPK)
+    unique_merged = len(merged_counts)
+    total_count = sum(merged_counts.values())
+    specificity = chain_specificity(merged_counts, presence, total_windows)
+
+    return {
+        "tags_raw": all_tags,
+        "tags_merged": merged_counts,
+        "tfidf": tfidf,
+        "label_tags_sorted": label_tags_sorted[:LABEL_TAGS_TOP_N],
+        "groups": groups,
+        "centroid": centroid,
+        "mean_prob": mean_prob,
+        "start": start_utc,
+        "end": end_utc,
+        "unique": unique_merged,
+        "count": total_count,
+        "coherence": coherence,
+        "purity": purity,
+        "specificity": specificity,
+    }
+
+
+def qualifies(summary: Dict, total_windows: int) -> bool:
+    counts_per_win = None
+
+    if summary["mean_prob"] < MIN_MEAN_PROB:
+        return False
+
+    if summary["unique"] < MIN_UNIQUE_TAGS:
+        return False
+
+    if summary["coherence"] < MIN_COHERENCE:
+        return False
+
+    if summary["purity"] < CONCENTRATION_MIN_SHARE:
+        return False
+
+    if summary["specificity"] < SPECIFICITY_MIN:
+        return False
+
+    if summary["count"] < SPIKE_MIN_SIZE:
+        return False
+
+    return True
+
+
+def _format_label_items(items: List[Tuple[str, float]]) -> str:
+
+    out = []
+    for t, w in items:
+        out.append(f"{t}:{round(float(w), 3)}")
+    return ", ".join(out)
+
+
+def _postprocess_label(raw: str) -> str:
+    s = raw.strip()
+    s = re.sub(r"\s+", " ", s)
+
+    for sep in [" and ", " & ", " / ", ", "]:
+        if sep in s.lower():
+
+            s = s.split(sep.strip())[0]
+            break
+
+    words = s.split()
+    if len(words) > 5:
+        s = " ".join(words[:5])
+    return s
+
+
+def label_trend_llm(
+    client: OpenAI,
+    subreddit: str,
+    label_items: List[Tuple[str, float]],
+    baseline_terms: List[str],
+) -> TrendLabel:
+    tag_str = _format_label_items(label_items)
+    baseline = ", ".join(sorted(set(_norm_key(b) for b in baseline_terms)))
     sys = (
-        "You name trends for an analytics dashboard. Use a plain descriptive label. "
-        "Constraints: use one to five words. Prefer proper nouns only when clearly present in the tags such as model names or product names. "
-        "Do not include the subreddit name. Do not produce labels that describe what the subreddit usually talks about. "
-        "Avoid marketing words such as pulse, hub, nexus, surge, revolution, momentum, guru, vortex, fusion, mastery, mania, craze. "
-        "Avoid made up compound words. Avoid cute phrasing. Keep capitalization minimal except for proper nouns. "
-        "Return compact JSON with fields label and description."
+        "You name trends for an analytics dashboard. Return a single, specific theme.\n"
+        "Rules:\n"
+        "• Use 1–5 words, plain descriptive language.\n"
+        "• Prefer proper nouns only when clearly present.\n"
+        "• Do NOT include the subreddit name.\n"
+        "• Do NOT describe the subreddit’s usual topics.\n"
+        "• Do NOT use marketing words (pulse, surge, momentum, etc.).\n"
+        "• Do NOT use cute phrasing or invented compounds.\n"
+        "• Do NOT join multiple topics with 'and', '/', '&' — pick the dominant single theme.\n"
+        "• Keep capitalization minimal except proper nouns.\n"
+        "Return compact JSON with fields: label, description."
     )
     user = (
-        f"Subreddit for context only: {subreddit}\n"
-        f"Baseline topics to ignore when naming: {baseline}\n"
-        f"Tags with counts for this candidate trend: {', '.join(tag_list)}\n"
-        f"Name a clear descriptive label and a one line description of what connects these tags."
+        f"Subreddit (context only): {subreddit}\n"
+        f"Baseline (ignore): {baseline}\n"
+        f"Informative tags with weights: {tag_str}\n"
+        f"Name ONE clear theme and one-line description."
     )
     try:
         resp = client.responses.parse(
             model=LABEL_MODEL,
-            input=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            input=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": user},
+            ],
             text_format=TrendLabel,
-            temperature=0
+            temperature=0,
         )
-        return TrendLabel.model_validate(resp.output_parsed)
+        parsed = TrendLabel.model_validate(resp.output_parsed)
+        parsed.label = _postprocess_label(parsed.label)
+        return parsed
     except Exception:
-        label = choose_fallback_label(tags)
-        return TrendLabel(label=label, description="Automatic fallback label from top tags")
+        parts = [t for t, _ in label_items[:3]]
+        s = " ".join(dict.fromkeys(parts)) or "topic"
+        s = _postprocess_label(s)
+        return TrendLabel(
+            label=s, description="Automatic fallback label from top informative tags"
+        )
 
-def clean_token(s: str) -> str:
-    s = s.replace("_", " ").strip()
-    s = " ".join(s.split())
-    return s
 
-def choose_fallback_label(tags: Dict[str, int]) -> str:
-    if not tags:
-        return ""
-    scored = sorted(tags.items(), key=lambda x: x[1], reverse=True)[:3]
-    parts = [clean_token(t) for t, _ in scored]
-    seen = set()
-    final = []
-    for t in parts:
-        k = t.lower()
-        if k in seen:
-            continue
-        seen.add(k)
-        final.append(t)
-    if not final:
-        final = [clean_token(next(iter(tags.keys())))]
-    return " ".join(final)
-
-def insert_trend(con: sqlite3.Connection, subreddit: str, window_size: int, summary: Dict, lab: TrendLabel) -> str:
+def insert_trend(
+    con: sqlite3.Connection,
+    subreddit: str,
+    window_size: int,
+    summary: Dict,
+    lab: TrendLabel,
+) -> str:
     tid = str(uuid.uuid4())
     cur = con.cursor()
-    execute_retry(cur, """
+    execute_retry(
+        cur,
+        """
         INSERT INTO trends(trend_id, subreddit, window_size_seconds, start_utc, end_utc, tag_count, unique_tag_count, mean_probability, centroid_json, label, label_model, created_utc)
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        tid,
-        subreddit,
-        int(window_size),
-        int(summary["start"]),
-        int(summary["end"]),
-        int(summary["count"]),
-        int(summary["unique"]),
-        float(summary["mean_prob"]),
-        json.dumps(summary["centroid"].tolist()),
-        lab.label,
-        LABEL_MODEL,
-        int(time.time())
-    ))
-    rows = [(tid, tg, int(ct)) for tg, ct in summary["tags"].items()]
-    executemany_retry(cur, "INSERT OR REPLACE INTO trend_tags(trend_id, tag, count) VALUES(?,?,?)", rows)
+    """,
+        (
+            tid,
+            subreddit,
+            int(window_size),
+            int(summary["start"]),
+            int(summary["end"]),
+            int(summary["count"]),
+            int(summary["unique"]),
+            float(summary["mean_prob"]),
+            json.dumps(summary["centroid"].tolist()),
+            lab.label,
+            LABEL_MODEL,
+            int(time.time()),
+        ),
+    )
+    rows = [(tid, tg, int(ct)) for tg, ct in summary["tags_merged"].items()]
+    executemany_retry(
+        cur,
+        "INSERT OR REPLACE INTO trend_tags(trend_id, tag, count) VALUES(?,?,?)",
+        rows,
+    )
     commit_retry(con)
     return tid
+
 
 def main():
     con = connect_db(SQLITE_DB)
@@ -435,27 +681,55 @@ def main():
                     continue
                 clusters = cluster_window(tags, X)
                 for _, d in clusters.items():
-                    window_clusters.append({
-                        "subreddit": sub,
-                        "window_size": w,
-                        "start": s,
-                        "end": e,
-                        "centroid": d["centroid"],
-                        "tag_counts": d["tag_counts"],
-                        "mean_prob": d["mean_prob"],
-                        "size": d["size"]
-                    })
+                    window_clusters.append(
+                        {
+                            "subreddit": sub,
+                            "window_size": w,
+                            "start": s,
+                            "end": e,
+                            "centroid": d["centroid"],
+                            "tag_counts": d["tag_counts"],
+                            "mean_prob": d["mean_prob"],
+                            "size": d["size"],
+                        }
+                    )
             if not window_clusters or total_windows == 0:
                 continue
             chains = stitch_clusters(window_clusters)
             baseline = baseline_terms_from_presence(presence, total_windows)
             for chain in chains:
-                if not qualifies(chain, total_windows, presence):
+
+                summary = summarize_chain(chain, con, presence, total_windows, baseline)
+
+                if not qualifies(summary, total_windows):
+                    if VERBOSE:
+                        print(
+                            f"[reject] {sub} w={w} "
+                            f"prob={summary['mean_prob']:.3f} "
+                            f"uniq={summary['unique']} "
+                            f"coh={summary['coherence']:.3f} "
+                            f"pur={summary['purity']:.3f} "
+                            f"spec={summary['specificity']:.3f} "
+                            f"count={summary['count']}"
+                        )
                     continue
-                summary = summarize_chain(chain)
-                lab = label_trend_llm(client, sub, summary["tags"], baseline)
+
+                lab = label_trend_llm(
+                    client, sub, summary["label_tags_sorted"], baseline
+                )
                 insert_trend(con, sub, w, summary, lab)
+
+                if VERBOSE:
+                    print(
+                        f"[accept] {sub} w={w} label='{lab.label}' "
+                        f"prob={summary['mean_prob']:.3f} "
+                        f"coh={summary['coherence']:.3f} "
+                        f"pur={summary['purity']:.3f} "
+                        f"spec={summary['specificity']:.3f}"
+                    )
+
     con.close()
+
 
 if __name__ == "__main__":
     main()
