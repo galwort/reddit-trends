@@ -34,23 +34,17 @@ STITCH_JACCARD_THRESHOLD = float(os.environ.get("STITCH_JACCARD_THRESHOLD", "0.3
 PERSIST_MIN_WINDOWS = int(os.environ.get("PERSIST_MIN_WINDOWS", "2"))
 COVERAGE_MAX_RATIO = float(os.environ.get("COVERAGE_MAX_RATIO", "0.5"))
 CONCENTRATION_TOPK = int(os.environ.get("CONCENTRATION_TOPK", "2"))
-CONCENTRATION_MIN_SHARE = float(
-    os.environ.get("CONCENTRATION_MIN_SHARE", "0.55")
-)  # lowered from 0.65
+CONCENTRATION_MIN_SHARE = float(os.environ.get("CONCENTRATION_MIN_SHARE", "0.6"))
 PEAK_TO_MEDIAN_RATIO = float(os.environ.get("PEAK_TO_MEDIAN_RATIO", "1.5"))
-MIN_UNIQUE_TAGS = int(os.environ.get("MIN_UNIQUE_TAGS", "1"))  # lowered from 3
-SPIKE_MIN_SIZE = int(os.environ.get("SPIKE_MIN_SIZE", "10"))  # lowered from 20
-SPECIFICITY_MIN = float(os.environ.get("SPECIFICITY_MIN", "0.45"))  # lowered from 0.55
-MIN_MEAN_PROB = float(os.environ.get("MIN_MEAN_PROB", "0.50"))
+MIN_UNIQUE_TAGS = int(os.environ.get("MIN_UNIQUE_TAGS", "2"))
+SPIKE_MIN_SIZE = int(os.environ.get("SPIKE_MIN_SIZE", "15"))
+SPECIFICITY_MIN = float(os.environ.get("SPECIFICITY_MIN", "0.5"))
+MIN_MEAN_PROB = float(os.environ.get("MIN_MEAN_PROB", "0.80"))
 GENERIC_RATE_LIMIT = float(os.environ.get("GENERIC_RATE_LIMIT", "0.8"))
-DEDUP_SIM_THRESHOLD = float(
-    os.environ.get("DEDUP_SIM_THRESHOLD", "0.88")
-)  # lowered from 0.92
+DEDUP_SIM_THRESHOLD = float(os.environ.get("DEDUP_SIM_THRESHOLD", "0.88"))
 COHERENCE_TOP_N = int(os.environ.get("COHERENCE_TOP_N", "20"))
-MIN_COHERENCE = float(os.environ.get("MIN_COHERENCE", "0.22"))  # lowered from 0.28
-TOP_GROUP_MIN_SHARE = float(
-    os.environ.get("TOP_GROUP_MIN_SHARE", "0.50")
-)  # lowered from 0.55
+MIN_COHERENCE = float(os.environ.get("MIN_COHERENCE", "0.5"))
+TOP_GROUP_MIN_SHARE = float(os.environ.get("TOP_GROUP_MIN_SHARE", "0.50"))
 LABEL_TAGS_TOP_N = int(os.environ.get("LABEL_TAGS_TOP_N", "18"))
 LABEL_MODEL = os.environ.get("LABEL_MODEL", "gpt-4o")
 VERBOSE = bool(int(os.environ.get("VERBOSE_TRENDS", "1")))
