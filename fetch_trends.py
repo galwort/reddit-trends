@@ -143,7 +143,8 @@ def ensure_trend_tables(con: sqlite3.Connection) -> None:
       created_utc INTEGER NOT NULL,
       coherence REAL,
       purity REAL,
-      specificity REAL
+      specificity REAL,
+      watermark_id TEXT
     )
     """,
     )
@@ -619,8 +620,23 @@ def insert_trend(
     summary: Dict,
     lab: TrendLabel,
 ) -> str:
-    tid = str(uuid.uuid4())
+    parts = [f"{_norm_key(t)}:{int(ct)}" for t, ct in summary["tags_merged"].items()]
+    parts.sort()
+    wsrc = (
+        f"{subreddit}|{int(window_size)}|{int(summary['start'])}|{int(summary['end'])}|"
+        + "|".join(parts)
+    )
+    wmid = str(uuid.uuid5(uuid.NAMESPACE_DNS, wsrc))
     cur = con.cursor()
+    execute_retry(
+        cur,
+        "SELECT trend_id FROM trends WHERE subreddit = ? AND window_size_seconds = ? AND start_utc = ? AND end_utc = ? AND watermark_id = ? LIMIT 1",
+        (subreddit, int(window_size), int(summary["start"]), int(summary["end"]), wmid),
+    )
+    row = fetchone_retry(cur)
+    if row and row[0]:
+        return row[0]
+    tid = str(uuid.uuid4())
     execute_retry(
         cur,
         """
@@ -628,8 +644,8 @@ def insert_trend(
             trend_id, subreddit, window_size_seconds, start_utc, end_utc,
             tag_count, unique_tag_count, mean_probability,
             label, label_model, created_utc,
-            coherence, purity, specificity
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            coherence, purity, specificity, watermark_id
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     """,
         (
             tid,
@@ -646,6 +662,7 @@ def insert_trend(
             float(summary.get("coherence", 0.0)),
             float(summary.get("purity", 0.0)),
             float(summary.get("specificity", 0.0)),
+            wmid,
         ),
     )
     rows = [(tid, tg, int(ct)) for tg, ct in summary["tags_merged"].items()]
@@ -670,7 +687,16 @@ def main():
         sizes = WINDOW_SIZES
         for w in sizes:
             step = max(1, w // 2)
-            starts = list(range(tmin, tmax + 1, step))
+            cur = con.cursor()
+            execute_retry(
+                cur,
+                "SELECT MAX(end_utc) FROM trends WHERE subreddit = ? AND window_size_seconds = ?",
+                (sub, int(w)),
+            )
+            row = fetchone_retry(cur)
+            last_end = row[0] if row and row[0] else None
+            start_floor = tmin if last_end is None else max(tmin, int(last_end) - step)
+            starts = list(range(start_floor, tmax + 1, step))
             window_clusters = []
             presence: Dict[str, int] = {}
             total_windows = 0
