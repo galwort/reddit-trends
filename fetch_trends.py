@@ -47,7 +47,7 @@ MIN_COHERENCE = float(os.environ.get("MIN_COHERENCE", "0.5"))
 TOP_GROUP_MIN_SHARE = float(os.environ.get("TOP_GROUP_MIN_SHARE", "0.50"))
 LABEL_TAGS_TOP_N = int(os.environ.get("LABEL_TAGS_TOP_N", "18"))
 LABEL_MODEL = os.environ.get("LABEL_MODEL", "gpt-4o")
-VERBOSE = bool(int(os.environ.get("VERBOSE_TRENDS", "1")))
+VERBOSE = int(os.environ.get("VERBOSE_TRENDS", "1"))
 
 
 class TrendLabel(BaseModel):
@@ -734,7 +734,7 @@ def main():
                 summary = summarize_chain(chain, con, presence, total_windows, baseline)
 
                 if not qualifies(summary, total_windows):
-                    if VERBOSE:
+                    if VERBOSE >= 2:
                         print(
                             f"[reject] {sub} w={w} "
                             f"prob={summary['mean_prob']:.3f} "
@@ -751,7 +751,7 @@ def main():
                 )
                 insert_trend(con, sub, w, summary, lab)
 
-                if VERBOSE:
+                if VERBOSE >= 1:
                     print(
                         f"[accept] {sub} w={w} label='{lab.label}' "
                         f"prob={summary['mean_prob']:.3f} "
