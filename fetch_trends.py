@@ -667,8 +667,7 @@ def main():
         tmin, tmax = fetch_time_range(con, sub)
         if not tmin or not tmax or tmax <= tmin:
             continue
-        full_size = tmax - tmin + 1
-        sizes = WINDOW_SIZES + [full_size]
+        sizes = WINDOW_SIZES
         for w in sizes:
             step = max(1, w // 2)
             starts = list(range(tmin, tmax + 1, step))
@@ -706,7 +705,6 @@ def main():
             chains = stitch_clusters(window_clusters)
             baseline = baseline_terms_from_presence(presence, total_windows)
             for chain in chains:
-
                 summary = summarize_chain(chain, con, presence, total_windows, baseline)
 
                 if not qualifies(summary, total_windows):
