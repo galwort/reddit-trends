@@ -17,7 +17,10 @@ import numpy as np
 import hdbscan
 from sklearn.preprocessing import normalize
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 from openai import OpenAI
+
+load_dotenv()
 
 SQLITE_DB = os.environ.get("SQLITE_DB", "reddit_trends.db")
 SQLITE_TIMEOUT_SEC = int(os.environ.get("SQLITE_TIMEOUT_SEC", "30"))
