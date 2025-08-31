@@ -66,7 +66,7 @@ def main():
     con = sqlite3.connect(db_path)
     con.execute("PRAGMA journal_mode=WAL")
     now_utc = int(datetime.now(tz=timezone.utc).timestamp())
-    lookback_hours = int(os.environ.get("LOAD_LOOKBACK_HOURS", "6"))
+    lookback_hours = int(os.environ.get("LOAD_LOOKBACK_HOURS", "48"))
     prefixes = hour_prefixes(now_utc, lookback_hours)
     total = 0
     for prefix in prefixes:

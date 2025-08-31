@@ -77,39 +77,49 @@ def main():
     con = sqlite3.connect(db_path)
     con.execute("PRAGMA journal_mode=WAL")
     ensure_tables(con)
-    rows = fetch_untagged(con, limit=20)
-    if not rows:
-        print("no untagged posts")
-        return
+    batch_size = int(os.environ.get("TAG_BATCH_SIZE", "100"))
+    max_per_run = int(os.environ.get("TAG_MAX_PER_RUN", "0"))
+    processed = 0
     client = OpenAI()
-    for pid, title, body in rows:
-        text = f"{title}\n\n{body or ''}"
-        sys = (
-            "You extract concise topical tags that a trend analyst would use."
-            " Return between five and eight tags."
-            " Each tag has sentiment from 0 to 1 where 0 is negative and 1 is positive."
-            " Confidence is from 0 to 1."
-            " Tags should be short canonical phrases."
-        )
-        user = f"Text:\n{text[:6000]}"
-        try:
-            resp = client.responses.parse(
-                model="gpt-4o",
-                input=[
-                    {"role": "system", "content": sys},
-                    {"role": "user", "content": user},
-                ],
-                text_format=TagList,
-                temperature=0,
+
+    while True:
+        if max_per_run and processed >= max_per_run:
+            break
+        remaining = batch_size if not max_per_run else min(batch_size, max_per_run - processed)
+        rows = fetch_untagged(con, limit=remaining)
+        if not rows:
+            if processed == 0:
+                print("no untagged posts")
+            break
+        for pid, title, body in rows:
+            text = f"{title}\n\n{body or ''}"
+            sys = (
+                "You extract concise topical tags that a trend analyst would use."
+                " Return between five and eight tags."
+                " Each tag has sentiment from 0 to 1 where 0 is negative and 1 is positive."
+                " Confidence is from 0 to 1."
+                " Tags should be short canonical phrases."
             )
-            parsed = resp.output_parsed
-            taglist = TagList.model_validate(parsed)
-            upsert_tags(con, pid, taglist.tags)
-            print(f"tagged {pid} count {len(taglist.tags)}")
-        except ValidationError as ve:
-            print(f"validation failed {pid} {ve}")
-        except Exception as e:
-            print(f"error {pid} {e}")
+            user = f"Text:\n{text[:6000]}"
+            try:
+                resp = client.responses.parse(
+                    model="gpt-4o",
+                    input=[
+                        {"role": "system", "content": sys},
+                        {"role": "user", "content": user},
+                    ],
+                    text_format=TagList,
+                    temperature=0,
+                )
+                parsed = resp.output_parsed
+                taglist = TagList.model_validate(parsed)
+                upsert_tags(con, pid, taglist.tags)
+                processed += 1
+                print(f"tagged {pid} count {len(taglist.tags)}")
+            except ValidationError as ve:
+                print(f"validation failed {pid} {ve}")
+            except Exception as e:
+                print(f"error {pid} {e}")
     con.close()
 
 

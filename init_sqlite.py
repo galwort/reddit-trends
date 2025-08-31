@@ -59,10 +59,13 @@ CREATE TABLE IF NOT EXISTS trends (
   tag_count INTEGER NOT NULL,
   unique_tag_count INTEGER NOT NULL,
   mean_probability REAL,
-  centroid_json TEXT NOT NULL,
   label TEXT,
   label_model TEXT,
-  created_utc INTEGER NOT NULL
+  created_utc INTEGER NOT NULL,
+  coherence REAL,
+  purity REAL,
+  specificity REAL,
+  watermark_id TEXT
 )
 """)
 cur.execute("""
