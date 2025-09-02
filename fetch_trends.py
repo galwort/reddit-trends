@@ -242,6 +242,7 @@ def cluster_window(tags: List[str], X: np.ndarray) -> Dict[int, Dict]:
     if X.size == 0:
         return {}
     if X.shape[0] < MIN_CLUSTER_SIZE:
+        print("Not enough points to cluster")
         return {}
     Xn = l2_normalize_matrix(X)
     clusterer = hdbscan.HDBSCAN(min_cluster_size=MIN_CLUSTER_SIZE, metric="euclidean")
